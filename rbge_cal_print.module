@@ -1,0 +1,334 @@
+<?php
+
+// set up the menu calls
+function rbge_cal_print_menu(){
+  
+    $items['rbge_print'] = array(
+        'title' => "Generate Print Reports",
+        'page callback' => 'rbge_cal_print_page',
+        'page arguments' => array(1),
+        'access callback' => 'rbge_cal_user_has_role',   
+        'access arguments' => array(array('Vocabulary Manager')), // arg 1 loads the user, arg 2 is the role name
+        'type' => MENU_NORMAL_ITEM,
+    );
+    
+    $items['rbge_print_get'] = array(
+        'title' => "Report Output",
+        'page callback' => 'rbge_cal_print_get',
+        'page arguments' => array(1),
+        'type' => MENU_CALLBACK,
+        'access callback' => true,
+    );
+    
+    return $items;
+}
+
+function rbge_cal_print_get($report_id){
+    
+    $out = array();
+    
+    $prefix = 'rbge_cal_print_' . $report_id . '_';
+    $title = variable_get($prefix . 'title');
+    $start = variable_get($prefix . 'start');
+    $end = variable_get($prefix . 'end');
+    $root_venue_tid = variable_get($prefix . 'root_venue_tid');
+    $category_tids = variable_get($prefix . 'category_tids');
+    $flag_tids = explode(',',variable_get($prefix . 'flag_tids'));
+    $order_tids = explode(',',variable_get($prefix . 'order_tids'));
+    
+    // the EntityFieldQuery stuff sucks for this complexity so lets do it in straight SQL
+    
+    $sql = "SELECT 
+        d.entity_id as nid
+        FROM field_data_field_event_date AS d
+        JOIN field_data_field_event_category AS c on c.entity_id = d.entity_id
+        JOIN field_data_field_event_flags AS f on f.entity_id = d.entity_id
+        WHERE CAST(d.field_event_date_value AS DATETIME) >= CAST('$start' AS DATETIME) 
+        AND CAST(d.field_event_date_value AS DATETIME) <= CAST('$end' AS DATETIME) 
+        AND d.delta = 0
+        AND c.field_event_category_tid IN ($category_tids)
+        ";
+        
+    foreach($flag_tids as $tid){
+        $sql .= " AND f.field_event_flags_tid = $tid";
+    }
+    
+    $sql .= " ORDER BY CAST(d.field_event_date_value AS DATETIME)";
+        
+    $result = db_query($sql);
+    
+    // set up the title bit
+    drupal_set_title($title);
+    $out["description"]['#type'] = 'markup';
+    $out["description"]['#markup'] = "<p>" . $result->rowCount() . " events from $start to $end. [". l('Edit', 'rbge_print/'. $report_id )  ."]</p>";
+    
+    // dpm($result);
+    
+    // load them all and wrap them
+    $event_nids = $result->fetchCol(0);
+    $events = array();
+    foreach($event_nids as $nid){
+        $events[] = entity_metadata_wrapper('node', node_load($nid)); 
+    }
+        
+    // work through the sections writing each out
+    $events_written = array();
+    foreach($order_tids as $tid){
+        
+        $section = taxonomy_term_load($tid);
+           
+        $out["section_title_$tid"]['#type'] = 'markup';
+        $out["section_title_$tid"]['#markup'] = "<h2 style=\"background-color: black; color: white; padding: 0.3em;\" >$section->name</h2>";
+        
+        $out["events_$tid"] = array();
+        
+        // work through events and write out the ones that are in this section
+        foreach($events as $event){
+            
+            $flags = $event->field_event_flags->value();
+            
+            foreach($flags as $flag){
+                if($flag->tid == $tid){
+                    $events_written[] = $event->getIdentifier();
+                    $out["events_$tid"]["event_{$tid}_". $event->getIdentifier()] = rbge_cal_print_get_event_render_array($event);
+                    break;
+                }
+            }
+        }
+        
+        if(count($out["events_$tid"]) == 0){
+            $out["events_$tid"]['#type'] = 'markup';
+            $out["events_$tid"]['#markup'] = "<p>No Events.</p>";
+        }
+    }
+   
+    // write out any that haven't been written out
+    if(count($events) > count($events_written)){
+       $out["section_title_orphans"]['#type'] = 'markup';
+       $out["section_title_orphans"]['#markup'] = "<h2>Orphaned Events</h2>";
+       foreach($events as $event){
+           if(in_array($event->getIdentifier(), $events_written)) continue;
+           $out["events_orphaned"]["event_orphaned_". $event->getIdentifier()] = rbge_cal_print_get_event_render_array($event);
+       }
+    }
+
+    
+    // dpm($out);
+    
+    return $out;
+    
+}
+
+function rbge_cal_print_get_event_render_array($event){
+    
+    $out = array();
+    
+    $out['event_top']['#type'] = 'markup';
+    $out['event_top']['#markup'] = '<div style="margin-top: 2em; ">';
+    
+    $out['title']['#type'] = 'markup';
+    $out['title']['#markup'] = '<h3 style="margin-bottom: 1em; padding-top: 1em; border-top: 1px gray solid;">' . $event->title->value(array('sanitize' => TRUE)) ."</h3>";
+
+    $out['body']['#type'] = 'markup';
+    $out['body']['#markup'] = $event->body->value->value();
+    
+    // venue
+    if($event->field_event_venue->value()){
+        $venue = $event->field_event_venue->value();
+        $vlink = l($venue->name, 'taxonomy/term/' . $venue->tid);
+        $out['venue']['#type'] = 'markup';
+        $out["venue"]['#markup'] = "<p><strong>Venue:</strong> $vlink</p>";
+    }
+    
+
+    $start_times = $event->field_advertised_start_time->value();
+    for($i = 0; $i < count($start_times); $i++){
+        $start = $start_times[$i];
+        $out["start_$i"]['#type'] = 'markup';
+        $out["start_$i"]['#markup'] = "<p><strong>Start Time:</strong> $start</p>";
+    }
+
+    $end_times = $event->field_advertised_end_time->value();
+    for($i = 0; $i < count($end_times); $i++){
+        $end = $end_times[$i];
+        $out["end_$i"]['#type'] = 'markup';
+        $out["end_$i"]['#markup'] = "<p><strong>End Time:</strong> $end</p>";
+    }
+    
+    $dates = $event->field_event_date->value();
+    for($i = 0; $i < count($dates); $i++){
+           $d = new DateTime($dates[$i]['value']);
+           
+           $ds = $d->format('l jS F Y');
+
+           $out["date_$i"]['#type'] = 'markup';
+           $out["date_$i"]['#markup'] = "<p><strong>Date:</strong> $ds</p>";
+     }
+     
+     // image
+    $image_data = $event->field_image->value();
+    if(count($image_data)){
+        $out['image']['#type'] = 'markup';
+        $img = theme('image_style',array('style_name' => 'thumbnail', 'path' => $image_data['uri']));
+        $img_ln = l($img, file_create_url($image_data['uri']), array('html' => TRUE));
+        $img_download = l("[Download]", file_create_url($image_data['uri']), array('attributes' => array('download' =>  $image_data['filename'])));
+        $out['image']['#markup'] =  $img_ln . "<br/>" . $img_download;
+    }
+
+    // image caption
+    if($event->field_image_caption->value()){
+        $cap = $event->field_image_caption->value();
+        $out['image_caption']['#type'] = 'markup';
+        $out["image_caption"]['#markup'] = "<p><strong>Caption:</strong> $cap</p>";
+    }  
+
+    // margin at bottom of event
+    $out['event_bottom']['#type'] = 'markup';
+    $out['event_bottom']['#markup'] = "</div>";
+
+  //  dpm($out);
+  
+    return $out;
+    
+}
+
+function rbge_cal_print_page($report_id){
+
+    $out = array();
+    
+    if(!$report_id) $report_id = 0;
+    
+    $out[] = rbge_cal_print_get_report_list($report_id);
+    $out[] = drupal_get_form('rbge_cal_print_get_form', $report_id);
+    
+    return $out;
+    
+}
+
+function rbge_cal_print_get_report_list($current_report_id){
+    
+    $out = array();
+    $out['#theme'] = 'item_list';
+    $out['#type'] = 'ol';
+    $out['#title'] = "Existing Reports";
+    
+    // we assume if there is a title set then it exists
+    for($i = 0; $i < 10; $i++){
+        if(variable_get('rbge_cal_print_' . $i . '_title')){
+            $out['#items'][] = rbge_cal_print_get_report_list_item($i, $current_report_id);
+        }
+    }
+    
+    return $out;
+    
+}
+
+function rbge_cal_print_get_report_list_item($report_id, $current_report_id){
+    
+    $title_var = 'rbge_cal_print_' . $report_id . '_title';
+    
+    $out = array();
+    
+    if($report_id == $current_report_id){
+        $load_link = '';
+    }else{
+        $load_link = ' [' . l('Load', 'rbge_print/' . $report_id) . ']';
+    }
+    $out[] = variable_get($title_var) . $load_link . ' [' . l('Get', 'rbge_print_get/' . $report_id) . ']';
+    
+    return $out;
+    
+}
+
+function rbge_cal_print_get_form($form, &$form_state, $report_id){
+    
+  $prefix = 'rbge_cal_print_' . $report_id . '_';
+
+  $form['title'] = array(
+    '#type' => 'markup',
+    '#markup' => "<p>&nbsp;</p><h3>Settings for report number ". ($report_id + 1) ."</h3><p>Only confirmed events will be included.</p>",
+  );
+
+  $form[$prefix . 'title'] = array(
+        '#type' => 'textfield', 
+        '#title' => t('Title'), 
+        '#default_value' => variable_get($prefix . 'title'),
+        '#size' => 60, 
+        '#maxlength' => 128,
+        '#required' => TRUE,
+  );
+  
+  $form[$prefix . 'start'] = array(
+    '#type' => 'date_popup',
+    '#title' => t('Start Date'),
+    '#date_format' => 'Y-m-d',
+    '#default_value' => variable_get($prefix . 'start'),
+    '#date_label_position' => null,
+    '#required' => TRUE,
+  );
+  
+  $form[$prefix . 'end'] = array(
+    '#type' => 'date_popup',
+    '#title' => t('End Date'),
+    '#date_format' => 'Y-m-d',
+    '#default_value' => variable_get($prefix . 'end'),
+    '#date_label_position' => null,
+    '#required' => TRUE,
+  );
+  
+  $form[$prefix . 'root_venue_tid'] = array(
+        '#type' => 'textfield', 
+        '#title' => t('Root Venue TID'), 
+        '#description' => "Events will be included that belong to this venue or one of its children.",
+        '#default_value' => variable_get($prefix . 'root_venue_tid'),
+        '#size' => 10, 
+        '#maxlength' => 5,
+        '#required' => TRUE,
+  );
+  
+  $form[$prefix . 'category_tids'] = array(
+        '#type' => 'textfield', 
+        '#title' => t('Category TIDs'), 
+        '#description' => "A comma separated list of TIDs for Categories to be included. This is an OR list. The event only has to belong to one of them. In fact it can only belong to one!", 
+        '#default_value' => variable_get($prefix . 'category_tids'),
+        '#size' => 100, 
+        '#maxlength' => 100,
+        '#required' => TRUE,
+  );
+  
+  $form[$prefix . 'flag_tids'] = array(
+        '#type' => 'textfield', 
+        '#title' => t('Flag TIDs'), 
+        '#description' => "A comma separated list of TIDs for Event Flags to be included. This is an AND list. The event has to belong to ALL of them to be in the output.", 
+        '#default_value' => variable_get($prefix . 'flag_tids'),
+        '#size' => 100, 
+        '#maxlength' => 100,
+        '#required' => TRUE,
+  );
+  
+  
+  $form[$prefix . 'order_tids'] = array(
+        '#type' => 'textfield', 
+        '#title' => t('Subheading TIDs'), 
+        '#description' => "A comma separated list of Flag TIDs that are the subheading for the output. This is order sensitive obviously.", 
+        '#default_value' => variable_get($prefix . 'order_tids'),
+        '#size' => 100, 
+        '#maxlength' => 100,
+        '#required' => TRUE,
+  );
+  
+  
+  return system_settings_form($form);
+
+
+}
+function rbge_cal_print_form_validate($form, &$form_state) {
+  // Validation logic.
+}
+
+function rbge_cal_print_form_submit($form, &$form_state) {
+  // Submission logic.
+}
+
+
+?>
